@@ -3,3 +3,4 @@ opencv-python-headless
 numpy
 deepface
 uuid
+protobuf==3.19.0  # 解決與 deepface 的相容性問題
