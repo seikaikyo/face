@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import sqlite3
 from deepface import DeepFace
+from ultralytics import YOLO
 import uuid
 
 # 初始化 SQLite 資料庫
@@ -11,17 +12,8 @@ c = conn.cursor()
 c.execute('''CREATE TABLE IF NOT EXISTS people (id TEXT PRIMARY KEY, gender TEXT, average_age REAL)''')
 conn.commit()
 
-# 加載 YOLO 模型
-yolo_config_path = 'yolov3.cfg'
-yolo_weights_path = 'yolov3.weights'
-yolo_labels_path = 'coco.names'
-
-with open(yolo_labels_path, 'r') as f:
-    labels = f.read().strip().split('\n')
-
-net = cv2.dnn.readNetFromDarknet(yolo_config_path, yolo_weights_path)
-layer_names = net.getLayerNames()
-output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
+# 加載 YOLOv8 模型
+model = YOLO('yolov8n.pt')  # 確保這個模型能夠檢測帽子和口罩
 
 st.title("即時影像辨識應用 - 性別與年齡辨識")
 
@@ -50,6 +42,7 @@ if run:
     id_input_placeholder = st.sidebar.empty()  # 用於顯示或輸入ID
     average_age_placeholder = st.sidebar.empty()  # 顯示年齡平均值
     save_button_placeholder = st.sidebar.empty()  # 用於顯示記錄按鈕
+    status_placeholder = st.sidebar.empty()  # 用於顯示狀態
 
     age_records = []
     gender = None  # 用於保存檢測到的性別
@@ -62,52 +55,47 @@ if run:
             st.write("無法讀取相機影像")
             break
 
-        # 準備 YOLO 輸入
-        (H, W) = frame.shape[:2]
-        blob = cv2.dnn.blobFromImage(frame, 1 / 255.0, (416, 416), swapRB=True, crop=False)
-        net.setInput(blob)
-        layer_outputs = net.forward(output_layers)
-
-        boxes = []
-        confidences = []
-        class_ids = []
-
-        for output in layer_outputs:
-            for detection in output:
-                scores = detection[5:]
-                class_id = np.argmax(scores)
-                confidence = scores[class_id]
-                if confidence > 0.5 and labels[class_id] == "person":
-                    box = detection[0:4] * np.array([W, H, W, H])
-                    (centerX, centerY, width, height) = box.astype("int")
-                    x = int(centerX - (width / 2))
-                    y = int(centerY - (height / 2))
-                    boxes.append([x, y, int(width), int(height)])
-                    confidences.append(float(confidence))
-                    class_ids.append(class_id)
-
-        idxs = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.3)
+        # 使用 YOLOv8 進行物件偵測
+        results = model(frame)
+        
+        # 顯示 YOLOv8 狀態
+        orig_shape = results[0].orig_shape
+        detected_objects = [model.names[int(box.cls)] for box in results[0].boxes]
+        person_count = detected_objects.count('person')
+        hat_count = detected_objects.count('hat') if 'hat' in model.names.values() else 0
+        mask_count = detected_objects.count('mask') if 'mask' in model.names.values() else 0
+        status_text = f"{orig_shape[1]}x{orig_shape[0]}, {person_count} person(s), {hat_count} hat(s), {mask_count} mask(s), {results[0].speed['inference']}ms\n"
+        status_text += f"Speed: {results[0].speed['preprocess']}ms preprocess, {results[0].speed['inference']}ms inference, {results[0].speed['postprocess']}ms postprocess per image at shape {orig_shape}\n"
+        status_text += f"Detected objects: {', '.join(detected_objects)}"
+        status_placeholder.markdown(f"### 狀態\n{status_text}")
 
         detected_faces = []
-        analysis_results = []  # 用來保存分析結果
-        if len(idxs) > 0:
-            for i in idxs.flatten():
-                (x, y, w, h) = boxes[i]
-                face = frame[y:y+h, x:x+w]
-                
-                # 進行影像分析
-                try:
-                    analysis = DeepFace.analyze(face, actions=['age', 'gender'], enforce_detection=False)
-                    
-                    for result in analysis:
-                        age = result['age']
-                        gender = result['dominant_gender']
-                        detected_faces.append((gender, age, x, y, w, h))
-                        analysis_results.append(f"Gender: {gender}, Age: {age}")
-                        age_records.append(age)
+        analysis_results = []
 
-                except Exception as e:
-                    st.write("影像分析失敗：", e)
+        for result in results:
+            for box in result.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                cls_name = model.names[int(box.cls)]
+                if cls_name == 'person':
+                    face = frame[y1:y2, x1:x2]
+
+                    # 進行影像分析
+                    try:
+                        analysis = DeepFace.analyze(face, actions=['age', 'gender'], enforce_detection=False)
+
+                        for result in analysis:
+                            age = result['age']
+                            gender = result['dominant_gender']
+                            detected_faces.append((gender, age, x1, y1, x2-x1, y2-y1))
+                            analysis_results.append(f"Gender: {gender}, Age: {age}")
+                            age_records.append(age)
+
+                    except Exception as e:
+                        st.write("影像分析失敗：", e)
+
+                # 繪製檢測到的物體框和標籤
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(frame, cls_name, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
 
         # 繪製檢測到的人臉框和標籤
         for (gender, age, x, y, w, h) in detected_faces:
